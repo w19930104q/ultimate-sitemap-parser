@@ -56,6 +56,54 @@ from .web_client.requests_client import RequestsWebClient
 log = logging.getLogger(__name__)
 
 
+class _SitemapFetchCache:
+    """Per-tree-crawl cache of HTTP responses, keyed by the requested URL.
+
+    A sitemap URL referenced from multiple branches (e.g. a sub-sitemap shared
+    by two sitemap indexes) goes through the complete client-error retry flow
+    at most once during a single tree crawl. Both the successful response and
+    the final failure are stored and reused by every other branch that
+    references the same URL.
+
+    Only the HTTP-level response is shared. Every branch keeps its own
+    recursion level, ancestor URL set and filtering decisions, and re-parses
+    the shared response on its own, so path-specific semantics (recursion
+    depth limits, ancestor/redirect loop detection and filter callbacks) are
+    unaffected. A new cache is created for every tree crawl, so subsequent
+    crawls re-fetch everything.
+    """
+
+    __slots__ = ["_responses"]
+
+    def __init__(self):
+        self._responses: dict[str, AbstractWebClientResponse] = {}
+
+    def get_or_fetch(
+        self,
+        url: str,
+        web_client: AbstractWebClient,
+        quiet_404: bool,
+    ) -> AbstractWebClientResponse:
+        """Return the cached response for ``url``, fetching it once if needed.
+
+        :param url: Requested URL to use as the cache key.
+        :param web_client: Web client to fetch with on a cache miss.
+        :param quiet_404: Whether 404 errors are expected on the fetch; only
+            affects logging and is used by the first (and only) fetch attempt.
+        :return: Cached or freshly fetched web client response.
+        """
+        try:
+            response = self._responses[url]
+            log.debug(f"Reusing cached response for URL {url}")
+            return response
+        except KeyError:
+            response = get_url_retry_on_client_errors(
+                url=url, web_client=web_client, quiet_404=quiet_404
+            )
+            self._responses[url] = response
+            return response
+
+
 class SitemapFetcher:
     """
     Fetches and parses the sitemap at a given URL, and any declared sub-sitemaps.
@@ -68,7 +116,7 @@ class SitemapFetcher:
 
     __MAX_RECURSION_LEVEL = 11
     """Max. depth level in iterating over sub-sitemaps.
-    
+
     Recursive sitemaps (i.e. child sitemaps pointing to their parent) are stopped immediately.
     """
 
@@ -80,6 +128,7 @@ class SitemapFetcher:
         "_quiet_404",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_fetch_cache",
     ]
 
     def __init__(
@@ -91,6 +140,7 @@ class SitemapFetcher:
         quiet_404: bool = False,
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        fetch_cache: _SitemapFetchCache | None = None,
     ):
         """
 
@@ -101,6 +151,7 @@ class SitemapFetcher:
         :param quiet_404: Whether 404 errors are expected and should be logged at a reduced level, useful for speculative fetching of known URLs.
         :param recurse_callback: Optional callback to filter out a sub-sitemap. See :data:`~.RecurseCallbackType`.
         :param recurse_list_callback: Optional callback to filter the list of sub-sitemaps. See :data:`~.RecurseListCallbackType`.
+        :param fetch_cache: Optional per-tree-crawl response cache. When supplied, identical request URLs are fetched (including the full retry flow) at most once per tree crawl; the cached success or final failure is reused by other branches. Path-specific state such as recursion level and parent URLs is never taken from the cache.
 
         :raises SitemapException: If the maximum recursion depth is exceeded.
         :raises SitemapException: If the URL is in the parent URLs set.
@@ -137,9 +188,19 @@ class SitemapFetcher:
 
         self._recurse_callback = recurse_callback
         self._recurse_list_callback = recurse_list_callback
+        self._fetch_cache = fetch_cache
 
     def _fetch(self) -> AbstractWebClientResponse:
         log.info(f"Fetching level {self._recursion_level} sitemap from {self._url}...")
+        if self._fetch_cache is not None:
+            # The response (success or the final exhausted-retry failure) is
+            # fetched at most once per tree crawl for a given request URL, but
+            # parsing and all path-specific checks still happen per branch.
+            return self._fetch_cache.get_or_fetch(
+                url=self._url,
+                web_client=self._web_client,
+                quiet_404=self._quiet_404,
+            )
         response = get_url_retry_on_client_errors(
             url=self._url, web_client=self._web_client, quiet_404=self._quiet_404
         )
@@ -189,6 +250,7 @@ class SitemapFetcher:
                 parent_urls=self._parent_urls,
                 recurse_callback=self._recurse_callback,
                 recurse_list_callback=self._recurse_list_callback,
+                fetch_cache=self._fetch_cache,
             )
 
         else:
@@ -202,6 +264,7 @@ class SitemapFetcher:
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    fetch_cache=self._fetch_cache,
                 )
             else:
                 parser = PlainTextSitemapParser(
@@ -254,6 +317,7 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         "_parent_urls",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_fetch_cache",
     ]
 
     def __init__(
@@ -265,12 +329,14 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        fetch_cache: _SitemapFetchCache | None = None,
     ):
         self._url = url
         self._content = content
         self._recursion_level = recursion_level
         self._web_client = web_client
         self._parent_urls = parent_urls
+        self._fetch_cache = fetch_cache
 
         if recurse_callback is None:  # Always allow child recursion
             self._recurse_callback = lambda url, level, parent_urls: True
@@ -304,6 +370,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        fetch_cache: _SitemapFetchCache | None = None,
     ):
         super().__init__(
             url=url,
@@ -313,6 +380,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            fetch_cache=fetch_cache,
         )
 
         if not self._url.endswith("/robots.txt"):
@@ -357,6 +425,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        fetch_cache=self._fetch_cache,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -425,6 +494,7 @@ class XMLSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        fetch_cache: _SitemapFetchCache | None = None,
     ):
         super().__init__(
             url=url,
@@ -434,6 +504,7 @@ class XMLSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            fetch_cache=fetch_cache,
         )
 
         # Will be initialized when the type of sitemap is known
@@ -556,6 +627,7 @@ class XMLSitemapParser(AbstractSitemapParser):
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    fetch_cache=self._fetch_cache,
                 )
 
             elif name == "rss":
@@ -687,6 +759,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         # List of sub-sitemap URLs found in this index sitemap
         "_sub_sitemap_urls",
         "_parent_urls",
+        "_fetch_cache",
     ]
 
     def __init__(
@@ -697,6 +770,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        fetch_cache: _SitemapFetchCache | None = None,
     ):
         super().__init__(
             url=url,
@@ -708,6 +782,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         self._recursion_level = recursion_level
         self._sub_sitemap_urls = []
         self._parent_urls = parent_urls
+        self._fetch_cache = fetch_cache
 
     def xml_element_end(self, name: str) -> None:
         if name == "sitemap:loc":
@@ -743,6 +818,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        fetch_cache=self._fetch_cache,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:

@@ -3,7 +3,7 @@
 import logging
 
 from .exceptions import SitemapException
-from .fetch_parse import SitemapFetcher, SitemapStrParser
+from .fetch_parse import SitemapFetcher, SitemapStrParser, _SitemapFetchCache
 from .helpers import (
     RecurseCallbackType,
     RecurseListCallbackType,
@@ -86,6 +86,12 @@ def sitemap_tree_for_homepage(
 
     sitemaps = []
 
+    # One response cache for the whole tree crawl: a URL requested by several
+    # branches (e.g. a sub-sitemap referenced by two indexes) is fetched with
+    # the complete retry flow at most once. A fresh cache per call means the
+    # next tree crawl re-fetches everything.
+    fetch_cache = _SitemapFetchCache()
+
     sitemap_urls_found_in_robots_txt = set()
     if use_robots:
         robots_txt_fetcher = SitemapFetcher(
@@ -95,6 +101,7 @@ def sitemap_tree_for_homepage(
             parent_urls=set(),
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            fetch_cache=fetch_cache,
         )
         robots_txt_sitemap = robots_txt_fetcher.sitemap()
         if not isinstance(robots_txt_sitemap, InvalidSitemap):
@@ -118,6 +125,7 @@ def sitemap_tree_for_homepage(
                     quiet_404=True,
                     recurse_callback=recurse_callback,
                     recurse_list_callback=recurse_list_callback,
+                    fetch_cache=fetch_cache,
                 )
                 unpublished_sitemap = unpublished_sitemap_fetcher.sitemap()
 

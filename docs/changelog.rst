@@ -1,6 +1,13 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**Changes**
+
+* Sub-sitemaps referenced from more than one branch of the sitemap tree (e.g. a shared sitemap index) are now fetched at most once during a single ``sitemap_tree_for_homepage`` crawl, including the full client-error retry flow. Both the successful response and the final failure are reused by every other branch referencing the same request URL, while each branch keeps its own recursion depth, ancestor loop detection and filter-callback decisions. Every new tree crawl starts with an empty cache and re-fetches all URLs.
+
 v1.8.1 (2026-06-16)
 -------------------
 
