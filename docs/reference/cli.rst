@@ -27,23 +27,26 @@ The CLI provides a simple command-line interface to retrieve sitemap data.
 
 .. code-block:: none
 
-    usage: usp ls [-h] [-f FORMAT] [-r] [-k] [-u] [-v/-vv] [-l LOG_FILE] url
+    usage: usp ls [-h] [-f FORMAT] [-r] [-k] [-u] [--resolve-relative-urls]
+                  [-v/-vv] [-l LOG_FILE] url
 
     download, parse and list the sitemap structure
 
     positional arguments:
-      url              URL of the site including protocol
+      url                   URL of the site including protocol
 
     options:
-      -h, --help       show this help message and exit
+      -h, --help            show this help message and exit
       -f FORMAT, --format FORMAT
                             set output format (default: tabtree)
                             choices:
                               tabtree: Sitemaps and pages, nested with tab indentation
                               pages: Flat list of pages, one per line
-      -r, --no-robots  don't discover sitemaps through robots.txt
-      -k, --no-known   don't discover sitemaps through well-known URLs
-      -u, --strip-url  strip the supplied URL from each page and sitemap URL
+      -r, --no-robots       don't discover sitemaps through robots.txt
+      -k, --no-known        don't discover sitemaps through well-known URLs
+      -u, --strip-url       strip the supplied URL from each page and sitemap URL
+      --resolve-relative-urls
+                            resolve relative URLs found in XML sitemaps against the document URL and xml:base attributes, instead of exporting them verbatim
       -v, --verbose         increase output verbosity (-v=INFO, -vv=DEBUG)
       -l LOG_FILE, --log-file LOG_FILE
                             write log to this file and suppress console output

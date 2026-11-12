@@ -48,6 +48,7 @@ def sitemap_tree_for_homepage(
     recurse_callback: RecurseCallbackType | None = None,
     recurse_list_callback: RecurseListCallbackType | None = None,
     normalize_homepage_url: bool = True,
+    resolve_relative_urls: bool = False,
 ) -> AbstractSitemap:
     """
     Using a homepage URL, fetch the tree of sitemaps and pages listed in them.
@@ -63,6 +64,11 @@ def sitemap_tree_for_homepage(
     :param normalize_homepage_url: Whether to normalize the provided homepage URL to the domain root (default: True),
         e.g. "http://www.example.com/xxx/yyy/" -> "http://www.example.com/".
         Disabling this may prevent sitemap discovery via robots.txt, as robots.txt is typically only available at the domain root.
+    :param resolve_relative_urls: Whether to resolve relative URLs encountered in XML sitemaps (index, urlset,
+        RSS and Atom formats, including image and ``hreflang`` alternate links) against the document URL and
+        in-scope ``xml:base`` attributes, instead of discarding or exporting them verbatim. The default base URL
+        is the document URL after any HTTP redirects. Defaults to ``False`` to preserve the historical behaviour.
+        robots.txt and plain text sitemap semantics are unaffected.
 
     :return: Root sitemap object of the fetched sitemap tree.
     """
@@ -95,6 +101,7 @@ def sitemap_tree_for_homepage(
             parent_urls=set(),
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            resolve_relative_urls=resolve_relative_urls,
         )
         robots_txt_sitemap = robots_txt_fetcher.sitemap()
         if not isinstance(robots_txt_sitemap, InvalidSitemap):
@@ -118,6 +125,7 @@ def sitemap_tree_for_homepage(
                     quiet_404=True,
                     recurse_callback=recurse_callback,
                     recurse_list_callback=recurse_list_callback,
+                    resolve_relative_urls=resolve_relative_urls,
                 )
                 unpublished_sitemap = unpublished_sitemap_fetcher.sitemap()
 
@@ -130,13 +138,25 @@ def sitemap_tree_for_homepage(
     return index_sitemap
 
 
-def sitemap_from_str(content: str) -> AbstractSitemap:
+def sitemap_from_str(
+    content: str,
+    resolve_relative_urls: bool = False,
+    base_url: str | None = None,
+) -> AbstractSitemap:
     """Parse sitemap from a string.
 
     Will return the parsed sitemaps, and any sub-sitemaps will be returned as :class:`~.InvalidSitemap`.
 
     :param content: Sitemap string to parse
+    :param resolve_relative_urls: Whether to resolve relative URLs against ``base_url`` and in-scope
+        ``xml:base`` attributes, instead of discarding or exporting them verbatim. Defaults to ``False``.
+    :param base_url: HTTP(S) URL to use as the default base URL when resolving relative URLs. Required,
+        and must be a valid HTTP(S) URL, when ``resolve_relative_urls`` is ``True``; ignored otherwise.
     :return: Parsed sitemap
     """
-    fetcher = SitemapStrParser(static_content=content)
+    fetcher = SitemapStrParser(
+        static_content=content,
+        resolve_relative_urls=resolve_relative_urls,
+        base_url=base_url,
+    )
     return fetcher.sitemap()

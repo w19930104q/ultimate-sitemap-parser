@@ -24,6 +24,7 @@ class TestTreeOpts(TreeTestBase):
             quiet_404=True,
             recurse_callback=None,
             recurse_list_callback=None,
+            resolve_relative_urls=False,
         )
 
     def test_filter_callback(self, requests_mock):
@@ -72,6 +73,7 @@ class TestTreeOpts(TreeTestBase):
             parent_urls=set(),
             recurse_callback=None,
             recurse_list_callback=None,
+            resolve_relative_urls=False,
         )
 
     def test_normalize_homepage_url_disabled(self, mock_fetcher):
@@ -91,6 +93,7 @@ class TestTreeOpts(TreeTestBase):
             parent_urls=set(),
             recurse_callback=None,
             recurse_list_callback=None,
+            resolve_relative_urls=False,
         )
 
     def test_normalize_homepage_url_with_extra_known_paths(self, mock_fetcher):
@@ -112,6 +115,7 @@ class TestTreeOpts(TreeTestBase):
             quiet_404=True,
             recurse_callback=None,
             recurse_list_callback=None,
+            resolve_relative_urls=False,
         )
 
         mock_fetcher.assert_any_call(
@@ -122,6 +126,7 @@ class TestTreeOpts(TreeTestBase):
             quiet_404=True,
             recurse_callback=None,
             recurse_list_callback=None,
+            resolve_relative_urls=False,
         )
 
     def test_skip_robots_txt(self, mock_fetcher):
@@ -144,4 +149,5 @@ class TestTreeOpts(TreeTestBase):
             quiet_404=True,
             recurse_callback=None,
             recurse_list_callback=None,
+            resolve_relative_urls=False,
         )

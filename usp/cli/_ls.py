@@ -47,6 +47,14 @@ def register(subparsers):
         help="strip the supplied URL from each page and sitemap URL",
     )
     ls_parser.add_argument(
+        "--resolve-relative-urls",
+        action="store_true",
+        help=(
+            "resolve relative URLs found in XML sitemaps against the document "
+            "URL and xml:base attributes, instead of exporting them verbatim"
+        ),
+    )
+    ls_parser.add_argument(
         "-v",
         "--verbose",
         action=CountAction,
@@ -61,7 +69,12 @@ def register(subparsers):
         type=str,
         help="write log to this file and suppress console output",
     )
-    ls_parser.set_defaults(no_robots=False, no_known=False, strip_url=False)
+    ls_parser.set_defaults(
+        no_robots=False,
+        no_known=False,
+        strip_url=False,
+        resolve_relative_urls=False,
+    )
 
     ls_parser.set_defaults(func=ls)
 
@@ -106,6 +119,7 @@ def ls(args):
         args.url,
         use_robots=not args.no_robots,
         use_known_paths=not args.no_known,
+        resolve_relative_urls=args.resolve_relative_urls,
     )
 
     strip_prefix = ""

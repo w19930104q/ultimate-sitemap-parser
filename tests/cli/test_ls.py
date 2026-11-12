@@ -37,7 +37,10 @@ def test_simple(run_cmd, mock_sitemap_tree, mock_output_tabtree, mock_output_pag
     run_cmd("ls https://example.org")
 
     mock_sitemap_tree.assert_called_once_with(
-        "https://example.org", use_robots=True, use_known_paths=True
+        "https://example.org",
+        use_robots=True,
+        use_known_paths=True,
+        resolve_relative_urls=False,
     )
     mock_output_tabtree.assert_called_once_with(mock_sitemap_tree.return_value, "")
     mock_output_pages.assert_not_called()
@@ -63,6 +66,21 @@ def test_discovery_args(
         "https://example.org",
         use_robots=exp_robot_val,
         use_known_paths=exp_known_paths_val,
+        resolve_relative_urls=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("arg", "exp_val"),
+    [("", False), ("--resolve-relative-urls", True)],
+)
+def test_resolve_relative_urls(run_cmd, mock_sitemap_tree, arg, exp_val):
+    run_cmd(f"ls https://example.org {arg}")
+    mock_sitemap_tree.assert_called_once_with(
+        "https://example.org",
+        use_robots=True,
+        use_known_paths=True,
+        resolve_relative_urls=exp_val,
     )
 
 

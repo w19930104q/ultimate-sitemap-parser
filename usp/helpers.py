@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from http import HTTPStatus
 from typing import TypeAlias
-from urllib.parse import unquote_plus, urlparse, urlunparse
+from urllib.parse import unquote_plus, urljoin, urlparse, urlunparse
 
 from dateutil.parser import isoparse as dateutil_isoparse
 from dateutil.parser import parse as dateutil_parse
@@ -84,6 +84,26 @@ def is_http_url(url: str) -> bool:
         return False
 
     return True
+
+
+def resolve_url(url: str, base_url: str) -> str | None:
+    """Resolve a (possibly relative) URL against a base URL.
+
+    Follows the RFC 3986 reference resolution algorithm (the same one used by
+    ``xml:base`` and HTML's ``<base>`` element): absolute URLs are returned
+    essentially unchanged, relative URLs are merged with ``base_url``.
+
+    :param url: URL to resolve, possibly relative.
+    :param base_url: Absolute base URL to resolve against.
+    :return: Resolved absolute URL, or ``None`` if the input cannot be parsed.
+    """
+    try:
+        return urljoin(base_url, url)
+    except Exception as ex:
+        log.warning(
+            f"Unable to resolve URL {url!r} against base URL {base_url!r}: {ex}"
+        )
+        return None
 
 
 def html_unescape_strip(string: str | None) -> str | None:

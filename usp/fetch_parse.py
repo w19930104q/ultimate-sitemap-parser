@@ -23,6 +23,7 @@ from .helpers import (
     is_http_url,
     parse_iso8601_date,
     parse_rfc2822_date,
+    resolve_url,
     ungzipped_response_content,
 )
 from .objects.page import (
@@ -55,6 +56,88 @@ from .web_client.requests_client import RequestsWebClient
 
 log = logging.getLogger(__name__)
 
+# Expat reports attributes from the reserved "xml" namespace under this
+# namespace URI, so "xml:base" arrives keyed as "<this URI> base".
+_XML_BASE_ATTR = "http://www.w3.org/XML/1998/namespace base"
+
+
+class BaseURIResolver:
+    """Track the in-scope base URI while streaming XML elements.
+
+    Implements the scoping rules of `XML Base (W3C Recommendation)
+    <https://www.w3.org/TR/xmlbase/>`_: each ``xml:base`` attribute is resolved
+    against the base URI inherited from the element's parent, and applies to
+    the element carrying it and all of its descendants. Pushing a base on an
+    element start and popping it on the matching element end keeps sibling
+    elements isolated from each other.
+
+    When relative URL resolution is disabled, :meth:`resolve` returns the URL
+    unchanged so that the historical behaviour is preserved byte-for-byte.
+    """
+
+    __slots__ = ["_enabled", "_base_stack"]
+
+    def __init__(self, document_url: str, enabled: bool):
+        """
+        :param document_url: URL of the document being parsed, used as the
+            default base URI (after redirects, when fetched over HTTP(S)).
+        :param enabled: Whether relative URLs should be resolved at all.
+        """
+        self._enabled = enabled
+        self._base_stack = [document_url] if enabled else []
+
+    @property
+    def enabled(self) -> bool:
+        """Whether relative URL resolution is enabled."""
+        return self._enabled
+
+    @property
+    def current_base(self) -> str | None:
+        """Base URI currently in scope, or ``None`` when resolution is disabled."""
+        return self._base_stack[-1] if self._base_stack else None
+
+    def push(self, attrs: dict[str, str]) -> None:
+        """Process the attributes of a starting element.
+
+        Has no effect when resolution is disabled, or when the element does
+        not carry an ``xml:base`` attribute.
+        """
+        if not self._enabled:
+            return
+
+        base_value = attrs.get(_XML_BASE_ATTR)
+        if base_value is not None:
+            base_value = base_value.strip()
+            if base_value:
+                resolved = resolve_url(base_value, self._base_stack[-1])
+                if resolved is not None:
+                    self._base_stack.append(resolved)
+                    return
+                log.warning(
+                    f"Unable to resolve xml:base {base_value!r}, "
+                    f"inheriting base URL {self._base_stack[-1]}"
+                )
+        # No (valid) xml:base on this element: the parent's base stays in scope
+        self._base_stack.append(self._base_stack[-1])
+
+    def pop(self) -> None:
+        """Leave the scope of the element most recently pushed."""
+        if self._enabled:
+            self._base_stack.pop()
+
+    def resolve(self, url: str | None) -> str | None:
+        """Resolve ``url`` against the base URI currently in scope.
+
+        When resolution is disabled, the URL is returned untouched.
+
+        :param url: Possibly relative URL, or ``None``.
+        :return: Resolved absolute URL when enabled, otherwise the input;
+            ``None`` if the URL could not be resolved.
+        """
+        if not self._enabled or url is None:
+            return url
+        return resolve_url(url, self._base_stack[-1])
+
 
 class SitemapFetcher:
     """
@@ -80,6 +163,7 @@ class SitemapFetcher:
         "_quiet_404",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_resolve_relative_urls",
     ]
 
     def __init__(
@@ -91,6 +175,7 @@ class SitemapFetcher:
         quiet_404: bool = False,
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        resolve_relative_urls: bool = False,
     ):
         """
 
@@ -101,6 +186,9 @@ class SitemapFetcher:
         :param quiet_404: Whether 404 errors are expected and should be logged at a reduced level, useful for speculative fetching of known URLs.
         :param recurse_callback: Optional callback to filter out a sub-sitemap. See :data:`~.RecurseCallbackType`.
         :param recurse_list_callback: Optional callback to filter the list of sub-sitemaps. See :data:`~.RecurseListCallbackType`.
+        :param resolve_relative_urls: Whether to resolve relative URLs found in XML sitemaps against
+            the document URL and in-scope ``xml:base`` attributes. Defaults to ``False`` to preserve
+            the historical behaviour of exporting relative URLs unchanged.
 
         :raises SitemapException: If the maximum recursion depth is exceeded.
         :raises SitemapException: If the URL is in the parent URLs set.
@@ -137,6 +225,7 @@ class SitemapFetcher:
 
         self._recurse_callback = recurse_callback
         self._recurse_list_callback = recurse_list_callback
+        self._resolve_relative_urls = resolve_relative_urls
 
     def _fetch(self) -> AbstractWebClientResponse:
         log.info(f"Fetching level {self._recursion_level} sitemap from {self._url}...")
@@ -189,6 +278,7 @@ class SitemapFetcher:
                 parent_urls=self._parent_urls,
                 recurse_callback=self._recurse_callback,
                 recurse_list_callback=self._recurse_list_callback,
+                resolve_relative_urls=self._resolve_relative_urls,
             )
 
         else:
@@ -202,6 +292,7 @@ class SitemapFetcher:
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    resolve_relative_urls=self._resolve_relative_urls,
                 )
             else:
                 parser = PlainTextSitemapParser(
@@ -210,6 +301,7 @@ class SitemapFetcher:
                     recursion_level=self._recursion_level,
                     web_client=self._web_client,
                     parent_urls=self._parent_urls,
+                    resolve_relative_urls=self._resolve_relative_urls,
                 )
 
         log.info(f"Parsing sitemap from URL {self._url}...")
@@ -227,15 +319,39 @@ class SitemapStrParser(SitemapFetcher):
 
     __slots__ = ["_static_content"]
 
-    def __init__(self, static_content: str):
+    def __init__(
+        self,
+        static_content: str,
+        resolve_relative_urls: bool = False,
+        base_url: str | None = None,
+    ):
         """Init a new string parser
 
         :param static_content: String containing sitemap text to parse
+        :param resolve_relative_urls: Whether to resolve relative URLs against
+            ``base_url`` and in-scope ``xml:base`` attributes.
+        :param base_url: HTTP(S) URL to use as the default base URL. Required,
+            and must be a valid HTTP(S) URL, when ``resolve_relative_urls`` is
+            ``True``; ignored otherwise.
+
+        :raises SitemapException: If relative URL resolution is enabled and
+            ``base_url`` is unset or not a valid HTTP(S) URL.
         """
+        if resolve_relative_urls:
+            if not base_url or not is_http_url(base_url):
+                raise SitemapException(
+                    "A valid HTTP(S) base_url must be supplied when "
+                    "resolve_relative_urls is enabled."
+                )
+            document_url = base_url
+        else:
+            document_url = "http://usp-local-dummy.local/"
+
         super().__init__(
-            url="http://usp-local-dummy.local/",
+            url=document_url,
             recursion_level=0,
             web_client=LocalWebClient(),
+            resolve_relative_urls=resolve_relative_urls,
         )
         self._static_content = static_content
 
@@ -254,6 +370,7 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         "_parent_urls",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_resolve_relative_urls",
     ]
 
     def __init__(
@@ -265,12 +382,14 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        resolve_relative_urls: bool = False,
     ):
         self._url = url
         self._content = content
         self._recursion_level = recursion_level
         self._web_client = web_client
         self._parent_urls = parent_urls
+        self._resolve_relative_urls = resolve_relative_urls
 
         if recurse_callback is None:  # Always allow child recursion
             self._recurse_callback = lambda url, level, parent_urls: True
@@ -304,6 +423,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        resolve_relative_urls: bool = False,
     ):
         super().__init__(
             url=url,
@@ -313,6 +433,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            resolve_relative_urls=resolve_relative_urls,
         )
 
         if not self._url.endswith("/robots.txt"):
@@ -357,6 +478,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        resolve_relative_urls=self._resolve_relative_urls,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -379,6 +501,31 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
 
 class PlainTextSitemapParser(AbstractSitemapParser):
     """Plain text sitemap parser."""
+
+    def __init__(
+        self,
+        url: str,
+        content: str,
+        recursion_level: int,
+        web_client: AbstractWebClient,
+        parent_urls: set[str],
+        recurse_callback: RecurseCallbackType | None = None,
+        recurse_list_callback: RecurseListCallbackType | None = None,
+        resolve_relative_urls: bool = False,
+    ):
+        # Plain text sitemaps have no notion of xml:base; relative URL
+        # resolution only applies to XML formats, so the flag is accepted for
+        # a consistent constructor signature but does not change parsing.
+        super().__init__(
+            url=url,
+            content=content,
+            recursion_level=recursion_level,
+            web_client=web_client,
+            parent_urls=parent_urls,
+            recurse_callback=recurse_callback,
+            recurse_list_callback=recurse_list_callback,
+            resolve_relative_urls=resolve_relative_urls,
+        )
 
     def sitemap(self) -> AbstractSitemap:
         story_urls = OrderedDict()
@@ -425,6 +572,7 @@ class XMLSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        resolve_relative_urls: bool = False,
     ):
         super().__init__(
             url=url,
@@ -434,6 +582,7 @@ class XMLSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            resolve_relative_urls=resolve_relative_urls,
         )
 
         # Will be initialized when the type of sitemap is known
@@ -546,6 +695,7 @@ class XMLSitemapParser(AbstractSitemapParser):
             if name == "sitemap:urlset":
                 self._concrete_parser = PagesXMLSitemapParser(
                     url=self._url,
+                    resolve_relative_urls=self._resolve_relative_urls,
                 )
 
             elif name == "sitemap:sitemapindex":
@@ -556,20 +706,27 @@ class XMLSitemapParser(AbstractSitemapParser):
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    resolve_relative_urls=self._resolve_relative_urls,
                 )
 
             elif name == "rss":
                 self._concrete_parser = PagesRSSSitemapParser(
                     url=self._url,
+                    resolve_relative_urls=self._resolve_relative_urls,
                 )
 
             elif name == "feed":
                 self._concrete_parser = PagesAtomSitemapParser(
                     url=self._url,
+                    resolve_relative_urls=self._resolve_relative_urls,
                 )
 
             else:
                 raise SitemapXMLParsingException(f"Unsupported root element '{name}'.")
+
+            # The root element itself may carry an xml:base attribute, so let
+            # the concrete parser process it just like any nested element
+            self._concrete_parser.xml_element_start(name=name, attrs=attrs)
 
     def _xml_element_end(self, name: str) -> None:
         name = self.__normalize_xml_element_name(name)
@@ -603,6 +760,8 @@ class AbstractXMLSitemapParser(metaclass=abc.ABCMeta):
         "_last_handler_call_was_xml_char_data",
         "_recurse_callback",
         "_recurse_list_callback",
+        # Tracks the in-scope base URI for relative URL resolution
+        "_base_uri_resolver",
     ]
 
     def __init__(
@@ -610,10 +769,15 @@ class AbstractXMLSitemapParser(metaclass=abc.ABCMeta):
         url: str,
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        resolve_relative_urls: bool = False,
     ):
         self._url = url
         self._last_char_data = ""
         self._last_handler_call_was_xml_char_data = False
+        self._base_uri_resolver = BaseURIResolver(
+            document_url=url,
+            enabled=resolve_relative_urls,
+        )
 
         if recurse_callback is None:  # Always allow child recursion
             self._recurse_callback = lambda url, level, parent_urls: True
@@ -634,7 +798,7 @@ class AbstractXMLSitemapParser(metaclass=abc.ABCMeta):
         :param attrs: element attributes
         """
         self._last_handler_call_was_xml_char_data = False
-        pass
+        self._base_uri_resolver.push(attrs=attrs)
 
     def xml_element_end(self, name: str) -> None:
         """Concrete parser handler when the end of an element is encountered.
@@ -646,6 +810,7 @@ class AbstractXMLSitemapParser(metaclass=abc.ABCMeta):
         # End of any element always resets last encountered character data
         self._last_char_data = ""
         self._last_handler_call_was_xml_char_data = False
+        self._base_uri_resolver.pop()
 
     def xml_char_data(self, data: str) -> None:
         """
@@ -697,11 +862,13 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        resolve_relative_urls: bool = False,
     ):
         super().__init__(
             url=url,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            resolve_relative_urls=resolve_relative_urls,
         )
 
         self._web_client = web_client
@@ -712,7 +879,11 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
     def xml_element_end(self, name: str) -> None:
         if name == "sitemap:loc":
             sub_sitemap_url = html_unescape_strip(self._last_char_data)
-            if not is_http_url(sub_sitemap_url):
+
+            if self._base_uri_resolver.enabled:
+                sub_sitemap_url = self._base_uri_resolver.resolve(sub_sitemap_url)
+
+            if not sub_sitemap_url or not is_http_url(sub_sitemap_url):
                 log.warning(
                     f"Sub-sitemap URL does not look like one: {sub_sitemap_url}"
                 )
@@ -743,6 +914,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        resolve_relative_urls=self._base_uri_resolver.enabled,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -948,13 +1120,32 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
 
     __slots__ = ["_current_page", "_pages", "_page_urls", "_current_image"]
 
-    def __init__(self, url: str):
-        super().__init__(url=url)
+    def __init__(self, url: str, resolve_relative_urls: bool = False):
+        super().__init__(url=url, resolve_relative_urls=resolve_relative_urls)
 
         self._current_page = None
         self._pages = []
         self._page_urls = set()
         self._current_image = None
+
+    def _resolve_url(self, url: str | None) -> str | None:
+        """Resolve a URL against the in-scope base, if resolution is enabled.
+
+        Non-HTTP(S) results (e.g. ``mailto:`` or ``javascript:`` links) are
+        skipped with a warning, mirroring the treatment of invalid URLs when
+        resolution is disabled.
+        """
+        if not self._base_uri_resolver.enabled or url is None:
+            return url
+
+        resolved = self._base_uri_resolver.resolve(url)
+        if resolved is not None and not is_http_url(resolved):
+            log.warning(
+                f"Resolved URL {resolved!r} (from {url!r}) is not an HTTP(S) "
+                f"URL, skipping"
+            )
+            return None
+        return resolved
 
     def xml_element_start(self, name: str, attrs: dict[str, str]) -> None:
         super().xml_element_start(name=name, attrs=attrs)
@@ -987,7 +1178,9 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
                     f"<link> element is missing hreflang or href attributes: {attrs}."
                 )
             else:
-                self._current_page.alternates.append((attrs["hreflang"], attrs["href"]))
+                href = self._resolve_url(attrs["href"])
+                if href is not None:
+                    self._current_page.alternates.append((attrs["hreflang"], href))
 
     def __require_last_char_data_to_be_set(self, name: str) -> None:
         if not self._last_char_data:
@@ -1002,18 +1195,22 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
             )
 
         if name == "sitemap:url":
-            if self._current_page.url not in self._page_urls:
+            page_url = self._current_page.url
+            if page_url is not None and page_url not in self._page_urls:
                 self._pages.append(self._current_page)
-                self._page_urls.add(self._current_page.url)
+                self._page_urls.add(page_url)
             self._current_page = None
         elif name == "image:image":
-            self._current_page.images.append(self._current_image)
+            # Images with no loc, or whose loc resolved to a non-HTTP(S) URL,
+            # are skipped; the reason was already logged in _resolve_url().
+            if self._current_image.loc:
+                self._current_page.images.append(self._current_image)
             self._current_image = None
         else:
             if name == "sitemap:loc":
                 # Every entry must have <loc>
                 self.__require_last_char_data_to_be_set(name=name)
-                self._current_page.url = self._last_char_data
+                self._current_page.url = self._resolve_url(self._last_char_data)
 
             elif name == "sitemap:lastmod":
                 # Element might be present but character data might be empty
@@ -1059,7 +1256,7 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
             elif name == "image:loc":
                 # Every image entry must have <loc>
                 self.__require_last_char_data_to_be_set(name=name)
-                self._current_image.loc = self._last_char_data
+                self._current_image.loc = self._resolve_url(self._last_char_data)
 
             elif name == "image:caption":
                 self._current_image.caption = self._last_char_data
@@ -1150,12 +1347,30 @@ class PagesRSSSitemapParser(AbstractXMLSitemapParser):
 
     __slots__ = ["_current_page", "_pages", "_page_links"]
 
-    def __init__(self, url: str):
-        super().__init__(url=url)
+    def __init__(self, url: str, resolve_relative_urls: bool = False):
+        super().__init__(url=url, resolve_relative_urls=resolve_relative_urls)
 
         self._current_page = None
         self._pages = []
         self._page_links = set()
+
+    def _resolve_url(self, url: str | None) -> str | None:
+        """Resolve a URL against the in-scope base, if resolution is enabled.
+
+        Non-HTTP(S) results are skipped with a warning, mirroring the
+        treatment of invalid URLs when resolution is disabled.
+        """
+        if not self._base_uri_resolver.enabled or url is None:
+            return url
+
+        resolved = self._base_uri_resolver.resolve(url)
+        if resolved is not None and not is_http_url(resolved):
+            log.warning(
+                f"Resolved URL {resolved!r} (from {url!r}) is not an HTTP(S) "
+                f"URL, skipping"
+            )
+            return None
+        return resolved
 
     def xml_element_start(self, name: str, attrs: dict[str, str]) -> None:
         super().xml_element_start(name=name, attrs=attrs)
@@ -1177,16 +1392,17 @@ class PagesRSSSitemapParser(AbstractXMLSitemapParser):
         # If within <item> already
         if self._current_page:
             if name == "item":
-                if self._current_page.link not in self._page_links:
+                page_link = self._current_page.link
+                if page_link is not None and page_link not in self._page_links:
                     self._pages.append(self._current_page)
-                    self._page_links.add(self._current_page.link)
+                    self._page_links.add(page_link)
                 self._current_page = None
 
             else:
                 if name == "link":
                     # Every entry must have <link>
                     self.__require_last_char_data_to_be_set(name=name)
-                    self._current_page.link = self._last_char_data
+                    self._current_page.link = self._resolve_url(self._last_char_data)
 
                 elif name == "title":
                     # Title (if set) can't be empty
@@ -1288,13 +1504,31 @@ class PagesAtomSitemapParser(AbstractXMLSitemapParser):
         "_last_link_rel_self_href",
     ]
 
-    def __init__(self, url: str):
-        super().__init__(url=url)
+    def __init__(self, url: str, resolve_relative_urls: bool = False):
+        super().__init__(url=url, resolve_relative_urls=resolve_relative_urls)
 
         self._current_page = None
         self._pages = []
         self._page_links = set()
         self._last_link_rel_self_href = None
+
+    def _resolve_url(self, url: str | None) -> str | None:
+        """Resolve a URL against the in-scope base, if resolution is enabled.
+
+        Non-HTTP(S) results are skipped with a warning, mirroring the
+        treatment of invalid URLs when resolution is disabled.
+        """
+        if not self._base_uri_resolver.enabled or url is None:
+            return url
+
+        resolved = self._base_uri_resolver.resolve(url)
+        if resolved is not None and not is_http_url(resolved):
+            log.warning(
+                f"Resolved URL {resolved!r} (from {url!r}) is not an HTTP(S) "
+                f"URL, skipping"
+            )
+            return None
+        return resolved
 
     def xml_element_start(self, name: str, attrs: dict[str, str]) -> None:
         super().xml_element_start(name=name, attrs=attrs)
@@ -1312,7 +1546,9 @@ class PagesAtomSitemapParser(AbstractXMLSitemapParser):
                     attrs.get("rel", "self").lower() == "self"
                     or self._last_link_rel_self_href is None
                 ):
-                    self._last_link_rel_self_href = attrs.get("href", None)
+                    self._last_link_rel_self_href = self._resolve_url(
+                        attrs.get("href", None)
+                    )
 
     def __require_last_char_data_to_be_set(self, name: str) -> None:
         if not self._last_char_data:
