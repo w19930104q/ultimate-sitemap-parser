@@ -5,6 +5,7 @@ Python API Reference
 .. toctree::
     :titlesonly:
 
+    usp.disk_cache
     usp.exceptions
     usp.fetch_parse
     usp.helpers

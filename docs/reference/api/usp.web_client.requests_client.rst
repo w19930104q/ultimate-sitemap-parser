@@ -17,3 +17,13 @@ usp.web_client.requests_client
     :members:
     :show-inheritance:
     :inherited-members:
+
+.. autoclass:: RequestsWebClientRedirectResponse
+    :members:
+    :show-inheritance:
+    :inherited-members:
+
+.. autoclass:: RequestsWebClientNotModifiedResponse
+    :members:
+    :show-inheritance:
+    :inherited-members:

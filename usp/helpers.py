@@ -154,6 +154,9 @@ def get_url_retry_on_client_errors(
     retry_count: int = 5,
     sleep_between_retries: int = 1,
     quiet_404: bool = False,
+    headers: dict[str, str] | None = None,
+    allow_redirects: bool = True,
+    accept_not_modified: bool = False,
 ) -> AbstractWebClientResponse:
     """
     Fetch URL, retry on retryable errors.
@@ -163,15 +166,31 @@ def get_url_retry_on_client_errors(
     :param retry_count: How many times to retry fetching the same URL.
     :param sleep_between_retries: How long to sleep between retries, in seconds.
     :param quiet_404: Whether to log 404 errors at a lower level.
+    :param headers: Additional headers to send with the request. Only supported
+        by web clients that accept them (currently the built-in Requests client).
+    :param allow_redirects: Whether to let the web client follow redirects.
+    :param accept_not_modified: Whether the web client should return ``304 Not
+        Modified`` as a distinct response instead of an error.
 
     :return: Web client response object.
     """
     assert retry_count > 0, "Retry count must be positive."
 
+    request_kwargs: dict = {}
+    if headers is not None:
+        request_kwargs["headers"] = headers
+    if not allow_redirects:
+        request_kwargs["allow_redirects"] = False
+    if accept_not_modified:
+        request_kwargs["accept_not_modified"] = True
+
     response = None
     for retry in range(0, retry_count):
         log.info(f"Fetching URL {url}...")
-        response = web_client.get(url)
+        if request_kwargs:
+            response = web_client.get(url, **request_kwargs)
+        else:
+            response = web_client.get(url)
 
         if isinstance(response, WebClientErrorResponse):
             if quiet_404 and response.message() == _404_log_message:
@@ -263,12 +282,17 @@ def ungzipped_response_content(
     url: str,
     response: AbstractWebClientSuccessResponse,
     max_uncompressed_bytes: int | None = None,
+    raise_on_error: bool = False,
 ) -> str:
     """
     Return HTTP response's decoded content, gunzip it if necessary.
 
     :param url: URL the response was fetched from.
     :param response: Response object.
+    :param max_uncompressed_bytes: Maximum allowed size after decompression.
+    :param raise_on_error: If true, raise :class:`~usp.exceptions.GunzipException`
+        when a seemingly gzipped response cannot be decompressed instead of
+        logging a warning and interpreting the bytes as an uncompressed sitemap.
     :return: Decoded and (if necessary) gunzipped response string.
     """
 
@@ -278,6 +302,8 @@ def ungzipped_response_content(
         try:
             data = gunzip(data, max_output_bytes=max_uncompressed_bytes)
         except GunzipException as ex:
+            if raise_on_error:
+                raise
             # In case of an error, just assume that it's one of the non-gzipped sitemaps with ".gz" extension
             log.warning(
                 f"Unable to gunzip response for {url}, maybe it's a non-gzipped sitemap: {ex}"

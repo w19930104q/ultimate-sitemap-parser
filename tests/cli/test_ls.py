@@ -101,6 +101,29 @@ def test_strip_url(run_cmd, mock_sitemap_tree, mock_output_tabtree, arg):
 
 
 @pytest.mark.parametrize(
+    ("cache_args", "exp_namespace"),
+    [
+        ("--cache-dir /tmp/usp-cache", "default"),
+        ("--cache-dir /tmp/usp-cache --cache-namespace ns", "ns"),
+    ],
+)
+def test_cache_args(run_cmd, mocker, mock_sitemap_tree, cache_args, exp_namespace):
+    mock_cache = mocker.patch("usp.cli._ls.DiskConditionalCache")
+
+    run_cmd(f"ls https://example.org {cache_args}")
+
+    mock_cache.assert_called_once_with(
+        directory="/tmp/usp-cache", namespace=exp_namespace
+    )
+    mock_sitemap_tree.assert_called_once_with(
+        "https://example.org",
+        use_robots=True,
+        use_known_paths=True,
+        cache=mock_cache.return_value,
+    )
+
+
+@pytest.mark.parametrize(
     ("v_arg", "exp_lvl"),
     [("", 0), ("-v", 1), ("--verbose", 1), ("-vv", 2), ("--verbose --verbose", 2)],
 )

@@ -19,6 +19,30 @@ To specify non-default options of the :class:`~usp.web_client.requests_client.Re
 
 See the constructor and methods of :class:`~usp.web_client.requests_client.RequestsWebClient` for available options.
 
+Conditional Disk Cache
+----------------------
+
+The Requests client can also be configured with an on-disk conditional cache for
+XML sitemaps. When enabled, sitemap URLs are revalidated with their stored
+``ETag`` / ``Last-Modified`` values and unchanged bodies are reused without being
+downloaded again:
+
+.. code-block:: python
+
+    from usp.web_client.requests_client import RequestsWebClient
+    from usp.tree import sitemap_tree_for_homepage
+
+    client = RequestsWebClient(
+        cache_dir='/var/cache/usp',
+        cache_namespace='example.org-default',
+    )
+    tree = sitemap_tree_for_homepage('https://www.example.org/', web_client=client)
+
+The cache key is the pair ``(namespace, URL)``. Use a distinct namespace for every
+representation variant that the same URL may return. The cache is disabled by
+default and is only available for XML sitemaps; see :doc:`disk-cache` for the full
+semantics.
+
 Custom Requests Session
 -----------------------
 

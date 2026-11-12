@@ -3,6 +3,7 @@ import sys
 from collections.abc import Iterator
 
 from usp.cli._util import CountAction, format_help, setup_logging, tabs
+from usp.disk_cache import DiskConditionalCache
 from usp.objects.sitemap import AbstractSitemap
 from usp.tree import sitemap_tree_for_homepage
 
@@ -61,6 +62,24 @@ def register(subparsers):
         type=str,
         help="write log to this file and suppress console output",
     )
+    ls_parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "enable the on-disk conditional XML sitemap cache and store entries "
+            "in this directory"
+        ),
+    )
+    ls_parser.add_argument(
+        "--cache-namespace",
+        type=str,
+        default="default",
+        help=(
+            "namespace for the cache; use a distinct value for every representation "
+            "variant of the same URLs (default: %(default)s)"
+        ),
+    )
     ls_parser.set_defaults(no_robots=False, no_known=False, strip_url=False)
 
     ls_parser.set_defaults(func=ls)
@@ -102,10 +121,17 @@ def _output_pages(sitemap: AbstractSitemap, strip_prefix: str = ""):
 def ls(args):
     setup_logging(args.verbosity, args.log_file)
 
+    cache = None
+    if args.cache_dir:
+        cache = DiskConditionalCache(
+            directory=args.cache_dir, namespace=args.cache_namespace
+        )
+
     tree = sitemap_tree_for_homepage(
         args.url,
         use_robots=not args.no_robots,
         use_known_paths=not args.no_known,
+        **({"cache": cache} if cache is not None else {}),
     )
 
     strip_prefix = ""

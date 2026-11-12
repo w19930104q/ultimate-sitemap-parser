@@ -12,9 +12,17 @@ import logging
 import re
 import xml.parsers.expat
 from collections import OrderedDict
+from collections.abc import Callable
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urljoin
 
-from .exceptions import SitemapException, SitemapXMLParsingException
+from .disk_cache import CacheEntry, DiskConditionalCache
+from .exceptions import (
+    GunzipException,
+    SitemapException,
+    SitemapXMLParsingException,
+)
 from .helpers import (
     RecurseCallbackType,
     RecurseListCallbackType,
@@ -51,9 +59,28 @@ from .web_client.abstract_client import (
     NoWebClientException,
     WebClientErrorResponse,
 )
-from .web_client.requests_client import RequestsWebClient
+from .web_client.requests_client import (
+    RequestsWebClient,
+    RequestsWebClientNotModifiedResponse,
+    RequestsWebClientRedirectResponse,
+)
 
 log = logging.getLogger(__name__)
+
+_MAX_HTTP_REDIRECTS = 30
+"""Maximum number of redirects followed for one cached fetch.
+
+Matches the default limit used by Requests."""
+
+
+@dataclass
+class _FetchResult:
+    """Result of a fetch that may have followed redirects manually."""
+
+    response: AbstractWebClientResponse
+    url: str
+    cache_entry: CacheEntry | None = None
+    conditional_request: bool = False
 
 
 class SitemapFetcher:
@@ -80,6 +107,7 @@ class SitemapFetcher:
         "_quiet_404",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_cache",
     ]
 
     def __init__(
@@ -91,6 +119,7 @@ class SitemapFetcher:
         quiet_404: bool = False,
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        cache: DiskConditionalCache | None = None,
     ):
         """
 
@@ -101,6 +130,9 @@ class SitemapFetcher:
         :param quiet_404: Whether 404 errors are expected and should be logged at a reduced level, useful for speculative fetching of known URLs.
         :param recurse_callback: Optional callback to filter out a sub-sitemap. See :data:`~.RecurseCallbackType`.
         :param recurse_list_callback: Optional callback to filter the list of sub-sitemaps. See :data:`~.RecurseListCallbackType`.
+        :param cache: Optional on-disk conditional cache for XML sitemaps. It is
+            only used with the built-in :class:`~.RequestsWebClient`; custom web
+            clients ignore it. ``None`` (the default) disables caching.
 
         :raises SitemapException: If the maximum recursion depth is exceeded.
         :raises SitemapException: If the URL is in the parent URLs set.
@@ -129,11 +161,23 @@ class SitemapFetcher:
 
         web_client.set_max_response_data_length(self.__MAX_SITEMAP_SIZE)
 
+        if cache is None and isinstance(web_client, RequestsWebClient):
+            # Allow the cache to be configured on the client instead of the fetcher.
+            cache = web_client.conditional_cache
+
+        if cache is not None and not isinstance(web_client, RequestsWebClient):
+            log.debug(
+                "Ignoring sitemap disk cache because the web client is not the "
+                "built-in Requests client."
+            )
+            cache = None
+
         self._url = url
         self._web_client = web_client
         self._recursion_level = recursion_level
         self._parent_urls = parent_urls or set()
         self._quiet_404 = quiet_404
+        self._cache = cache
 
         self._recurse_callback = recurse_callback
         self._recurse_list_callback = recurse_list_callback
@@ -145,6 +189,129 @@ class SitemapFetcher:
         )
         return response
 
+    def _fetch_with_redirects(self, start_url: str, use_cache: bool) -> _FetchResult:
+        """Fetch a URL, following redirects one hop at a time.
+
+        Each hop looks up validators for *that hop's URL* only. Conditional headers
+        from a previous hop are never reused, so a redirect target is always
+        revalidated against its own cache entry.
+        """
+        url = start_url
+        redirect_count = 0
+
+        while True:
+            log.info(f"Fetching level {self._recursion_level} sitemap from {url}...")
+
+            cache_entry = None
+            headers: dict[str, str] = {}
+            if use_cache and self._cache is not None:
+                cache_entry = self._cache.read(url)
+                if cache_entry is not None:
+                    headers = cache_entry.conditional_headers()
+
+            response = get_url_retry_on_client_errors(
+                url=url,
+                web_client=self._web_client,
+                quiet_404=self._quiet_404,
+                headers=headers,
+                allow_redirects=False,
+                accept_not_modified=True,
+            )
+
+            if isinstance(response, RequestsWebClientRedirectResponse):
+                location = response.header("location")
+                if not location:
+                    return _FetchResult(
+                        response=WebClientErrorResponse(
+                            message=(
+                                f"Redirect response from {url} did not include a "
+                                "Location header."
+                            ),
+                            retryable=False,
+                        ),
+                        url=url,
+                    )
+
+                redirect_count += 1
+                if redirect_count > _MAX_HTTP_REDIRECTS:
+                    return _FetchResult(
+                        response=WebClientErrorResponse(
+                            message=(
+                                f"Exceeded {_MAX_HTTP_REDIRECTS} redirects while "
+                                f"fetching {start_url}."
+                            ),
+                            retryable=False,
+                        ),
+                        url=url,
+                    )
+
+                next_url = urljoin(url, location)
+                if not is_http_url(next_url):
+                    return _FetchResult(
+                        response=WebClientErrorResponse(
+                            message=(
+                                f"Redirect from {url} points to a non-HTTP(s) URL: "
+                                f"{next_url}."
+                            ),
+                            retryable=False,
+                        ),
+                        url=url,
+                    )
+
+                log.debug(f"Redirected from {url} to {next_url}.")
+                url = next_url
+                # Deliberately do not carry any conditional headers to the next
+                # hop; the next iteration looks up validators for next_url.
+                continue
+
+            return _FetchResult(
+                response=response,
+                url=url,
+                cache_entry=cache_entry,
+                conditional_request=bool(headers),
+            )
+
+    def _update_cache_after_parse(
+        self,
+        url: str,
+        body: bytes,
+        etag: str | None,
+        last_modified: str | None,
+    ) -> None:
+        """Commit a successfully parsed XML body to the cache.
+
+        Cache failures are reported but never make parsing fail; because writes
+        are atomic, the previous entry remains available in that case.
+        """
+        if self._cache is None:
+            return
+
+        try:
+            etag = etag.strip() if etag else None
+            last_modified = last_modified.strip() if last_modified else None
+
+            if etag or last_modified:
+                self._cache.write(
+                    url=url,
+                    body=body,
+                    etag=etag,
+                    last_modified=last_modified,
+                )
+                log.debug(f"Updated sitemap cache entry for {url}.")
+            else:
+                # A successful response without validators invalidates any older
+                # entry: it could otherwise cause a stale conditional 304 later.
+                self._cache.delete(url)
+                log.debug(
+                    f"Removed sitemap cache entry for {url} because the response "
+                    "had no validators."
+                )
+        except Exception as ex:
+            log.error(
+                f"Unable to update sitemap cache entry for {url}; keeping the "
+                f"previous entry: {ex}"
+            )
+
     def sitemap(self) -> AbstractSitemap:
         """
         Fetch and parse the sitemap.
@@ -152,16 +319,73 @@ class SitemapFetcher:
         :return: the parsed sitemap. Will be a child of :class:`~.AbstractSitemap`.
             If an HTTP error is encountered, or the sitemap cannot be parsed, will be :class:`~.InvalidSitemap`.
         """
-        response = self._fetch()
+        cache_enabled = self._cache is not None and isinstance(
+            self._web_client, RequestsWebClient
+        )
 
-        if isinstance(response, WebClientErrorResponse):
-            return InvalidSitemap(
-                url=self._url,
-                reason=f"Unable to fetch sitemap from {self._url}: {response.message()}",
+        if cache_enabled:
+            fetch_result = self._fetch_with_redirects(self._url, use_cache=True)
+        else:
+            response = self._fetch()
+            response_url = (
+                response.url()
+                if isinstance(response, AbstractWebClientSuccessResponse)
+                else self._url
             )
-        assert isinstance(response, AbstractWebClientSuccessResponse)
+            fetch_result = _FetchResult(response=response, url=response_url)
 
-        response_url = response.url()
+        response = fetch_result.response
+        response_url = fetch_result.url
+        cached_entry: CacheEntry | None = None
+
+        if isinstance(response, RequestsWebClientNotModifiedResponse):
+            if (
+                fetch_result.conditional_request
+                and fetch_result.cache_entry is not None
+                and fetch_result.cache_entry.decodable_body()
+            ):
+                # Reuse the cached body, but re-parse it from scratch below using
+                # this round's recursion level, ancestor set and filter callbacks.
+                cached_entry = fetch_result.cache_entry
+                log.debug(
+                    f"Using cached sitemap body for {response_url} after 304 Not "
+                    "Modified."
+                )
+            else:
+                # No usable body for this 304. Make exactly one unconditional
+                # request; a second 304 is a protocol error and yields an
+                # InvalidSitemap.
+                log.warning(
+                    f"Received 304 Not Modified for {response_url} without a usable "
+                    "cached body; making one unconditional request."
+                )
+                fallback = self._fetch_with_redirects(response_url, use_cache=False)
+                response = fallback.response
+                response_url = fallback.url
+
+                if isinstance(response, RequestsWebClientNotModifiedResponse):
+                    return InvalidSitemap(
+                        url=response_url,
+                        reason=(
+                            f"Received 304 Not Modified for {response_url} after an "
+                            "unconditional request and no cached body is available."
+                        ),
+                    )
+
+        if cached_entry is None:
+            if isinstance(response, WebClientErrorResponse):
+                return InvalidSitemap(
+                    url=self._url,
+                    reason=f"Unable to fetch sitemap from {self._url}: {response.message()}",
+                )
+            if isinstance(response, RequestsWebClientRedirectResponse):
+                # Only possible if redirect handling was bypassed unexpectedly.
+                return InvalidSitemap(
+                    url=self._url,
+                    reason=f"Unexpected redirect response while fetching {self._url}.",
+                )
+            assert isinstance(response, AbstractWebClientSuccessResponse)
+
         log.debug(f"Response URL is {response_url}")
         if response_url in self._parent_urls:
             # Likely a sitemap has redirected to a parent URL
@@ -172,14 +396,62 @@ class SitemapFetcher:
 
         self._url = response_url
 
-        response_content = ungzipped_response_content(
-            url=self._url,
-            response=response,
-            max_uncompressed_bytes=self.__MAX_SITEMAP_SIZE,
-        )
+        decompression_failed = False
+        if cached_entry is not None:
+            response_content = cached_entry.body.decode("utf-8")
+            commit_body = cached_entry.body
+        else:
+            try:
+                response_content = ungzipped_response_content(
+                    url=self._url,
+                    response=response,
+                    max_uncompressed_bytes=self.__MAX_SITEMAP_SIZE,
+                    raise_on_error=True,
+                )
+            except GunzipException as ex:
+                # Preserve the previous cache entry and report the error, but keep
+                # the historical tolerant parsing behaviour.
+                log.error(
+                    f"Unable to decompress sitemap from {self._url}; the cache will "
+                    f"not be updated: {ex}"
+                )
+                decompression_failed = True
+                response_content = ungzipped_response_content(
+                    url=self._url,
+                    response=response,
+                    max_uncompressed_bytes=self.__MAX_SITEMAP_SIZE,
+                )
+            commit_body = response_content.encode("utf-8")
 
         # MIME types returned in Content-Type are unpredictable, so peek into the content instead
-        if response_content[:20].strip().startswith("<"):
+        is_xml = response_content[:20].strip().startswith("<")
+
+        on_parse_complete = None
+        if cache_enabled and is_xml and not decompression_failed:
+            if cached_entry is not None:
+                merged_entry = cached_entry.merged_with(
+                    etag=response.header("etag"),
+                    last_modified=response.header("last-modified"),
+                )
+                etag = merged_entry.etag
+                last_modified = merged_entry.last_modified
+            else:
+                etag = response.header("etag")
+                last_modified = response.header("last-modified")
+
+            # Only called once this XML document has parsed completely. Passing a
+            # callback (rather than committing here) also ensures that a failure
+            # while fetching child sitemaps cannot prevent the parent XML from
+            # being committed.
+            def on_parse_complete() -> None:
+                self._update_cache_after_parse(
+                    url=response_url,
+                    body=commit_body,
+                    etag=etag,
+                    last_modified=last_modified,
+                )
+
+        if is_xml:
             # XML sitemap (the specific kind is to be determined later)
             parser = XMLSitemapParser(
                 url=self._url,
@@ -189,6 +461,8 @@ class SitemapFetcher:
                 parent_urls=self._parent_urls,
                 recurse_callback=self._recurse_callback,
                 recurse_list_callback=self._recurse_list_callback,
+                cache=self._cache if cache_enabled else None,
+                on_parse_complete=on_parse_complete,
             )
 
         else:
@@ -202,6 +476,7 @@ class SitemapFetcher:
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    cache=self._cache if cache_enabled else None,
                 )
             else:
                 parser = PlainTextSitemapParser(
@@ -254,6 +529,7 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         "_parent_urls",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_cache",
     ]
 
     def __init__(
@@ -265,12 +541,14 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        cache: DiskConditionalCache | None = None,
     ):
         self._url = url
         self._content = content
         self._recursion_level = recursion_level
         self._web_client = web_client
         self._parent_urls = parent_urls
+        self._cache = cache
 
         if recurse_callback is None:  # Always allow child recursion
             self._recurse_callback = lambda url, level, parent_urls: True
@@ -304,6 +582,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        cache: DiskConditionalCache | None = None,
     ):
         super().__init__(
             url=url,
@@ -313,6 +592,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            cache=cache,
         )
 
         if not self._url.endswith("/robots.txt"):
@@ -357,6 +637,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        **({"cache": self._cache} if self._cache is not None else {}),
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -414,6 +695,7 @@ class XMLSitemapParser(AbstractSitemapParser):
     __slots__ = [
         "_concrete_parser",
         "_is_non_ns_sitemap",
+        "_on_parse_complete",
     ]
 
     def __init__(
@@ -425,6 +707,8 @@ class XMLSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        cache: DiskConditionalCache | None = None,
+        on_parse_complete: Callable[[], None] | None = None,
     ):
         super().__init__(
             url=url,
@@ -434,12 +718,16 @@ class XMLSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            cache=cache,
         )
 
         # Will be initialized when the type of sitemap is known
         self._concrete_parser = None
         # Whether this is a malformed sitemap with no namespace
         self._is_non_ns_sitemap = False
+        # Called after the whole XML document has parsed successfully, before
+        # child sitemaps are fetched.
+        self._on_parse_complete = on_parse_complete
 
     def sitemap(self) -> AbstractSitemap:
         parser = xml.parsers.expat.ParserCreate(
@@ -461,9 +749,11 @@ class XMLSitemapParser(AbstractSitemapParser):
         parser.EntityDeclHandler = _xml_hardening_handler("ENTITY")
         parser.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
 
+        parse_completed = False
         try:
             is_final = True
             parser.Parse(self._content, is_final)
+            parse_completed = True
         except Exception as ex:
             # Some sitemap XML files might end abruptly because webservers might be timing out on returning huge XML
             # files so don't return InvalidSitemap() but try to get as much pages as possible
@@ -474,6 +764,17 @@ class XMLSitemapParser(AbstractSitemapParser):
                 url=self._url,
                 reason=f"No parsers support sitemap from {self._url}",
             )
+
+        # Commit the cache only after this XML document has parsed completely.
+        # This happens before the concrete parser fetches child sitemaps so that
+        # failures in a child subgraph cannot prevent the parent from committing.
+        if parse_completed and self._on_parse_complete is not None:
+            try:
+                self._on_parse_complete()
+            except Exception as ex:
+                log.error(
+                    f"Unable to finalise sitemap cache entry for {self._url}: {ex}"
+                )
 
         return self._concrete_parser.sitemap()
 
@@ -556,6 +857,7 @@ class XMLSitemapParser(AbstractSitemapParser):
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    cache=self._cache,
                 )
 
             elif name == "rss":
@@ -603,6 +905,7 @@ class AbstractXMLSitemapParser(metaclass=abc.ABCMeta):
         "_last_handler_call_was_xml_char_data",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_cache",
     ]
 
     def __init__(
@@ -610,10 +913,12 @@ class AbstractXMLSitemapParser(metaclass=abc.ABCMeta):
         url: str,
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        cache: DiskConditionalCache | None = None,
     ):
         self._url = url
         self._last_char_data = ""
         self._last_handler_call_was_xml_char_data = False
+        self._cache = cache
 
         if recurse_callback is None:  # Always allow child recursion
             self._recurse_callback = lambda url, level, parent_urls: True
@@ -697,11 +1002,13 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        cache: DiskConditionalCache | None = None,
     ):
         super().__init__(
             url=url,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            cache=cache,
         )
 
         self._web_client = web_client
@@ -743,6 +1050,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        **({"cache": self._cache} if self._cache is not None else {}),
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:

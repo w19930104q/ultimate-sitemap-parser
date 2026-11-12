@@ -2,6 +2,7 @@
 
 import logging
 
+from .disk_cache import DiskConditionalCache
 from .exceptions import SitemapException
 from .fetch_parse import SitemapFetcher, SitemapStrParser
 from .helpers import (
@@ -48,6 +49,7 @@ def sitemap_tree_for_homepage(
     recurse_callback: RecurseCallbackType | None = None,
     recurse_list_callback: RecurseListCallbackType | None = None,
     normalize_homepage_url: bool = True,
+    cache: DiskConditionalCache | None = None,
 ) -> AbstractSitemap:
     """
     Using a homepage URL, fetch the tree of sitemaps and pages listed in them.
@@ -63,6 +65,9 @@ def sitemap_tree_for_homepage(
     :param normalize_homepage_url: Whether to normalize the provided homepage URL to the domain root (default: True),
         e.g. "http://www.example.com/xxx/yyy/" -> "http://www.example.com/".
         Disabling this may prevent sitemap discovery via robots.txt, as robots.txt is typically only available at the domain root.
+    :param cache: Optional on-disk conditional cache for XML sitemaps. It is
+        only used with the built-in :class:`~.RequestsWebClient` (the default);
+        custom clients ignore it. ``None`` (the default) disables caching.
 
     :return: Root sitemap object of the fetched sitemap tree.
     """
@@ -88,7 +93,7 @@ def sitemap_tree_for_homepage(
 
     sitemap_urls_found_in_robots_txt = set()
     if use_robots:
-        robots_txt_fetcher = SitemapFetcher(
+        robots_txt_fetcher_kwargs = dict(
             url=robots_txt_url,
             web_client=web_client,
             recursion_level=0,
@@ -96,6 +101,9 @@ def sitemap_tree_for_homepage(
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
         )
+        if cache is not None:
+            robots_txt_fetcher_kwargs["cache"] = cache
+        robots_txt_fetcher = SitemapFetcher(**robots_txt_fetcher_kwargs)
         robots_txt_sitemap = robots_txt_fetcher.sitemap()
         if not isinstance(robots_txt_sitemap, InvalidSitemap):
             sitemaps.append(robots_txt_sitemap)
@@ -110,7 +118,7 @@ def sitemap_tree_for_homepage(
 
             # Don't refetch URLs already found in robots.txt
             if unpublished_sitemap_url not in sitemap_urls_found_in_robots_txt:
-                unpublished_sitemap_fetcher = SitemapFetcher(
+                unpublished_sitemap_fetcher_kwargs = dict(
                     url=unpublished_sitemap_url,
                     web_client=web_client,
                     recursion_level=0,
@@ -118,6 +126,11 @@ def sitemap_tree_for_homepage(
                     quiet_404=True,
                     recurse_callback=recurse_callback,
                     recurse_list_callback=recurse_list_callback,
+                )
+                if cache is not None:
+                    unpublished_sitemap_fetcher_kwargs["cache"] = cache
+                unpublished_sitemap_fetcher = SitemapFetcher(
+                    **unpublished_sitemap_fetcher_kwargs
                 )
                 unpublished_sitemap = unpublished_sitemap_fetcher.sitemap()
 

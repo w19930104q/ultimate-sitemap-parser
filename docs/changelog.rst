@@ -1,6 +1,17 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**New Features**
+
+* Added an optional on-disk conditional cache for XML sitemaps, enabled through
+  :class:`~usp.disk_cache.DiskConditionalCache` or ``RequestsWebClient(cache_dir=...)``.
+  It revalidates cached bodies with ``ETag`` / ``Last-Modified`` and is disabled by
+  default. See :doc:`/guides/disk-cache`.
+* Added ``--cache-dir`` and ``--cache-namespace`` options to ``usp ls``.
+
 v1.8.1 (2026-06-16)
 -------------------
 
