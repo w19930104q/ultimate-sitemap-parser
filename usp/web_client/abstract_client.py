@@ -3,6 +3,7 @@
 import abc
 import random
 import time
+from collections.abc import Iterator
 from http import HTTPStatus
 
 RETRYABLE_HTTP_STATUS_CODES = {
@@ -53,7 +54,13 @@ class AbstractWebClientResponse(metaclass=abc.ABCMeta):
     Abstract response.
     """
 
-    pass
+    def close(self) -> None:
+        """Release any resources held by this response.
+
+        The default implementation does nothing. Implementing clients should
+        close their underlying connection/stream here.
+        """
+        pass
 
 
 class AbstractWebClientSuccessResponse(
@@ -108,6 +115,26 @@ class AbstractWebClientSuccessResponse(
         :return: URL fetched.
         """
         raise NotImplementedError("Abstract method.")
+
+    def supports_streaming(self) -> bool:
+        """Return whether this response can be consumed in chunks.
+
+        Responses that do not implement streaming are read through
+        :meth:`raw_data` using the original, fully-buffered code path.
+        """
+        return False
+
+    def iter_content(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+        """Yield the response body in chunks.
+
+        The default implementation is suitable for fully-buffered responses.
+        Streaming-capable responses should override this method.
+        """
+        yield self.raw_data()
+
+    def close(self) -> None:
+        """Release any resources held by this response."""
+        pass
 
 
 class WebClientErrorResponse(AbstractWebClientResponse, metaclass=abc.ABCMeta):

@@ -8,6 +8,7 @@
 """
 
 import abc
+import codecs
 import logging
 import re
 import xml.parsers.expat
@@ -41,6 +42,11 @@ from .objects.sitemap import (
     PagesRSSSitemap,
     PagesTextSitemap,
     PagesXMLSitemap,
+)
+from .streaming import (
+    DEFAULT_STREAM_CHUNK_SIZE,
+    StreamingPagesStore,
+    iter_response_content,
 )
 from .web_client.abstract_client import (
     AbstractWebClient,
@@ -80,6 +86,7 @@ class SitemapFetcher:
         "_quiet_404",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_streaming",
     ]
 
     def __init__(
@@ -91,6 +98,7 @@ class SitemapFetcher:
         quiet_404: bool = False,
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        streaming: bool = False,
     ):
         """
 
@@ -101,6 +109,10 @@ class SitemapFetcher:
         :param quiet_404: Whether 404 errors are expected and should be logged at a reduced level, useful for speculative fetching of known URLs.
         :param recurse_callback: Optional callback to filter out a sub-sitemap. See :data:`~.RecurseCallbackType`.
         :param recurse_list_callback: Optional callback to filter the list of sub-sitemaps. See :data:`~.RecurseListCallbackType`.
+        :param streaming: Whether to parse XML URL sets incrementally, storing pages and
+            duplicate-detection state on disk instead of in memory. Disabled by default.
+            Responses from web clients that do not support streaming fall back to the
+            original buffered code path.
 
         :raises SitemapException: If the maximum recursion depth is exceeded.
         :raises SitemapException: If the URL is in the parent URLs set.
@@ -137,6 +149,7 @@ class SitemapFetcher:
 
         self._recurse_callback = recurse_callback
         self._recurse_list_callback = recurse_list_callback
+        self._streaming = streaming
 
     def _fetch(self) -> AbstractWebClientResponse:
         log.info(f"Fetching level {self._recursion_level} sitemap from {self._url}...")
@@ -154,36 +167,51 @@ class SitemapFetcher:
         """
         response = self._fetch()
 
-        if isinstance(response, WebClientErrorResponse):
-            return InvalidSitemap(
+        try:
+            if isinstance(response, WebClientErrorResponse):
+                return InvalidSitemap(
+                    url=self._url,
+                    reason=f"Unable to fetch sitemap from {self._url}: {response.message()}",
+                )
+            assert isinstance(response, AbstractWebClientSuccessResponse)
+
+            response_url = response.url()
+            log.debug(f"Response URL is {response_url}")
+            if response_url in self._parent_urls:
+                # Likely a sitemap has redirected to a parent URL
+                return InvalidSitemap(
+                    url=self._url,
+                    reason=f"Recursion detected when {self._url} redirected to {response_url} with parent URLs {self._parent_urls}.",
+                )
+
+            self._url = response_url
+
+            # Streaming is only used when both the caller opted in and the web
+            # client is able to hand out the body in chunks. Other clients use
+            # the original fully-buffered path.
+            if self._streaming and response.supports_streaming():
+                return self._sitemap_from_stream(response=response)
+
+            response_content = ungzipped_response_content(
                 url=self._url,
-                reason=f"Unable to fetch sitemap from {self._url}: {response.message()}",
-            )
-        assert isinstance(response, AbstractWebClientSuccessResponse)
-
-        response_url = response.url()
-        log.debug(f"Response URL is {response_url}")
-        if response_url in self._parent_urls:
-            # Likely a sitemap has redirected to a parent URL
-            return InvalidSitemap(
-                url=self._url,
-                reason=f"Recursion detected when {self._url} redirected to {response_url} with parent URLs {self._parent_urls}.",
+                response=response,
+                max_uncompressed_bytes=self.__MAX_SITEMAP_SIZE,
             )
 
-        self._url = response_url
+            return self._sitemap_from_content(content=response_content)
+        finally:
+            # Make sure the underlying HTTP response is always released, even
+            # when parsing raises or the caller drops a partially-read body.
+            response.close()
 
-        response_content = ungzipped_response_content(
-            url=self._url,
-            response=response,
-            max_uncompressed_bytes=self.__MAX_SITEMAP_SIZE,
-        )
-
+    def _sitemap_from_content(self, content: str) -> AbstractSitemap:
+        """Parse sitemap content that has already been fully read."""
         # MIME types returned in Content-Type are unpredictable, so peek into the content instead
-        if response_content[:20].strip().startswith("<"):
+        if content[:20].strip().startswith("<"):
             # XML sitemap (the specific kind is to be determined later)
             parser = XMLSitemapParser(
                 url=self._url,
-                content=response_content,
+                content=content,
                 recursion_level=self._recursion_level,
                 web_client=self._web_client,
                 parent_urls=self._parent_urls,
@@ -192,30 +220,96 @@ class SitemapFetcher:
             )
 
         else:
-            # Assume that it's some sort of a text file (robots.txt or plain text sitemap)
-            if self._url.endswith("/robots.txt"):
-                parser = IndexRobotsTxtSitemapParser(
+            return self._text_sitemap_from_content(content=content)
+
+        log.info(f"Parsing sitemap from URL {self._url}...")
+        return parser.sitemap()
+
+    def _text_sitemap_from_content(self, content: str) -> AbstractSitemap:
+        """Parse a non-XML sitemap (robots.txt or a plain text URL list)."""
+        if self._url.endswith("/robots.txt"):
+            parser = IndexRobotsTxtSitemapParser(
+                url=self._url,
+                content=content,
+                recursion_level=self._recursion_level,
+                web_client=self._web_client,
+                parent_urls=self._parent_urls,
+                recurse_callback=self._recurse_callback,
+                recurse_list_callback=self._recurse_list_callback,
+                streaming=self._streaming,
+            )
+        else:
+            parser = PlainTextSitemapParser(
+                url=self._url,
+                content=content,
+                recursion_level=self._recursion_level,
+                web_client=self._web_client,
+                parent_urls=self._parent_urls,
+            )
+
+        log.info(f"Parsing sitemap from URL {self._url}...")
+        return parser.sitemap()
+
+    def _sitemap_from_stream(
+        self, response: AbstractWebClientSuccessResponse
+    ) -> AbstractSitemap:
+        """Parse a response incrementally, without buffering the whole body."""
+        chunks = iter_response_content(
+            response=response,
+            url=self._url,
+            max_uncompressed_bytes=self.__MAX_SITEMAP_SIZE,
+            chunk_size=DEFAULT_STREAM_CHUNK_SIZE,
+        )
+
+        try:
+            try:
+                first_chunk = next(chunks)
+            except StopIteration:
+                first_chunk = None
+
+            if first_chunk is not None and self._chunk_starts_with_xml(first_chunk):
+                chunk_source = self._replay_first_chunk(first_chunk, chunks)
+                parser = XMLSitemapParser(
                     url=self._url,
-                    content=response_content,
+                    content="",
                     recursion_level=self._recursion_level,
                     web_client=self._web_client,
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    streaming=True,
+                    chunk_source=chunk_source,
                 )
-            else:
-                parser = PlainTextSitemapParser(
-                    url=self._url,
-                    content=response_content,
-                    recursion_level=self._recursion_level,
-                    web_client=self._web_client,
-                    parent_urls=self._parent_urls,
-                )
+                log.info(f"Parsing streaming sitemap from URL {self._url}...")
+                return parser.sitemap()
 
-        log.info(f"Parsing sitemap from URL {self._url}...")
-        sitemap = parser.sitemap()
+            # Robots.txt and plain text sitemaps are not streamed; read the
+            # remainder (usually small) and use the original parser path.
+            parts = [first_chunk] if first_chunk is not None else []
+            parts.extend(chunks)
+            content = b"".join(parts).decode("utf-8-sig", errors="replace")
+            return self._text_sitemap_from_content(content=content)
+        finally:
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                close()
 
-        return sitemap
+    @staticmethod
+    def _chunk_starts_with_xml(chunk: bytes) -> bool:
+        """Return True if a chunk's textual prefix looks like XML."""
+        prefix = chunk[:64].decode("utf-8-sig", errors="replace").strip()
+        return prefix.startswith("<")
+
+    @staticmethod
+    def _replay_first_chunk(first_chunk: bytes, chunks):
+        """Yield the peeked chunk and then the rest, closing ``chunks``."""
+        try:
+            yield first_chunk
+            yield from chunks
+        finally:
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                close()
 
 
 class SitemapStrParser(SitemapFetcher):
@@ -227,15 +321,19 @@ class SitemapStrParser(SitemapFetcher):
 
     __slots__ = ["_static_content"]
 
-    def __init__(self, static_content: str):
+    def __init__(self, static_content: str, streaming: bool = False):
         """Init a new string parser
 
         :param static_content: String containing sitemap text to parse
+        :param streaming: Whether to request streaming parsing. Local content
+            is already buffered, so this normally falls back to the original
+            parsing path.
         """
         super().__init__(
             url="http://usp-local-dummy.local/",
             recursion_level=0,
             web_client=LocalWebClient(),
+            streaming=streaming,
         )
         self._static_content = static_content
 
@@ -254,6 +352,7 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         "_parent_urls",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_streaming",
     ]
 
     def __init__(
@@ -265,12 +364,14 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        streaming: bool = False,
     ):
         self._url = url
         self._content = content
         self._recursion_level = recursion_level
         self._web_client = web_client
         self._parent_urls = parent_urls
+        self._streaming = streaming
 
         if recurse_callback is None:  # Always allow child recursion
             self._recurse_callback = lambda url, level, parent_urls: True
@@ -304,6 +405,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        streaming: bool = False,
     ):
         super().__init__(
             url=url,
@@ -313,6 +415,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            streaming=streaming,
         )
 
         if not self._url.endswith("/robots.txt"):
@@ -357,6 +460,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        streaming=self._streaming,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -414,6 +518,7 @@ class XMLSitemapParser(AbstractSitemapParser):
     __slots__ = [
         "_concrete_parser",
         "_is_non_ns_sitemap",
+        "_chunk_source",
     ]
 
     def __init__(
@@ -425,6 +530,8 @@ class XMLSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        streaming: bool = False,
+        chunk_source=None,
     ):
         super().__init__(
             url=url,
@@ -434,14 +541,18 @@ class XMLSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            streaming=streaming,
         )
 
         # Will be initialized when the type of sitemap is known
         self._concrete_parser = None
         # Whether this is a malformed sitemap with no namespace
         self._is_non_ns_sitemap = False
+        # Iterable of decompressed byte chunks when streaming is enabled
+        self._chunk_source = chunk_source
 
-    def sitemap(self) -> AbstractSitemap:
+    def _create_expat_parser(self):
+        """Create a hardened Expat parser with the sitemap handlers registered."""
         parser = xml.parsers.expat.ParserCreate(
             namespace_separator=self.__XML_NAMESPACE_SEPARATOR
         )
@@ -460,6 +571,16 @@ class XMLSitemapParser(AbstractSitemapParser):
         parser.StartDoctypeDeclHandler = _xml_hardening_handler("DOCTYPE")
         parser.EntityDeclHandler = _xml_hardening_handler("ENTITY")
         parser.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
+        return parser
+
+    def sitemap(self) -> AbstractSitemap:
+        if self._streaming and self._chunk_source is not None:
+            return self._sitemap_streaming()
+
+        return self._sitemap_buffered()
+
+    def _sitemap_buffered(self) -> AbstractSitemap:
+        parser = self._create_expat_parser()
 
         try:
             is_final = True
@@ -476,6 +597,46 @@ class XMLSitemapParser(AbstractSitemapParser):
             )
 
         return self._concrete_parser.sitemap()
+
+    def _sitemap_streaming(self) -> AbstractSitemap:
+        parser = self._create_expat_parser()
+        # Reproduce the non-streaming path's UTF-8 (BOM-stripping, replacement
+        # on invalid bytes) decoding while feeding Expat incrementally.
+        decoder = codecs.getincrementaldecoder("utf-8-sig")(errors="replace")
+        chunks = self._chunk_source
+
+        try:
+            try:
+                for chunk in chunks:
+                    text = decoder.decode(chunk, False)
+                    if text:
+                        parser.Parse(text, False)
+
+                final_text = decoder.decode(b"", True)
+                parser.Parse(final_text, True)
+            except Exception as ex:
+                # Retain everything parsed before the error/truncation. This
+                # includes a truncated <url> entry, which is discarded because
+                # it was never completed.
+                log.error(
+                    f"Parsing streaming sitemap from URL {self._url} failed: {ex}"
+                )
+
+            if not self._concrete_parser:
+                return InvalidSitemap(
+                    url=self._url,
+                    reason=f"No parsers support sitemap from {self._url}",
+                )
+
+            try:
+                return self._concrete_parser.sitemap()
+            except Exception:
+                self._concrete_parser.cleanup()
+                raise
+        finally:
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                close()
 
     def __normalize_xml_element_name(self, name: str):
         """
@@ -546,6 +707,7 @@ class XMLSitemapParser(AbstractSitemapParser):
             if name == "sitemap:urlset":
                 self._concrete_parser = PagesXMLSitemapParser(
                     url=self._url,
+                    streaming=self._streaming,
                 )
 
             elif name == "sitemap:sitemapindex":
@@ -556,6 +718,7 @@ class XMLSitemapParser(AbstractSitemapParser):
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    streaming=self._streaming,
                 )
 
             elif name == "rss":
@@ -675,6 +838,14 @@ class AbstractXMLSitemapParser(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError("Abstract method.")
 
+    def cleanup(self) -> None:
+        """Release any temporary resources held while parsing.
+
+        Called when parsing fails before the parsed sitemap can take ownership
+        of them. The default implementation does nothing.
+        """
+        pass
+
 
 class IndexXMLSitemapParser(AbstractXMLSitemapParser):
     """
@@ -687,6 +858,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         # List of sub-sitemap URLs found in this index sitemap
         "_sub_sitemap_urls",
         "_parent_urls",
+        "_streaming",
     ]
 
     def __init__(
@@ -697,6 +869,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        streaming: bool = False,
     ):
         super().__init__(
             url=url,
@@ -708,6 +881,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         self._recursion_level = recursion_level
         self._sub_sitemap_urls = []
         self._parent_urls = parent_urls
+        self._streaming = streaming
 
     def xml_element_end(self, name: str) -> None:
         if name == "sitemap:loc":
@@ -743,6 +917,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        streaming=self._streaming,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -946,15 +1121,24 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
                 alternates=alternates,
             )
 
-    __slots__ = ["_current_page", "_pages", "_page_urls", "_current_image"]
+    __slots__ = [
+        "_current_page",
+        "_pages",
+        "_page_urls",
+        "_current_image",
+        "_streaming_store",
+    ]
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, streaming: bool = False):
         super().__init__(url=url)
 
         self._current_page = None
         self._pages = []
         self._page_urls = set()
         self._current_image = None
+
+        # When streaming, pages and the duplicate-detection index live on disk.
+        self._streaming_store = StreamingPagesStore() if streaming else None
 
     def xml_element_start(self, name: str, attrs: dict[str, str]) -> None:
         super().xml_element_start(name=name, attrs=attrs)
@@ -1002,9 +1186,18 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
             )
 
         if name == "sitemap:url":
-            if self._current_page.url not in self._page_urls:
-                self._pages.append(self._current_page)
-                self._page_urls.add(self._current_page.url)
+            if self._streaming_store is not None:
+                # Deduplicate in the on-disk index using the raw URL string,
+                # exactly like the in-memory implementation. The first entry
+                # wins and keeps its extension fields.
+                if self._streaming_store.add_if_new(self._current_page.url):
+                    page = self._current_page.page()
+                    if page is not None:
+                        self._streaming_store.append(page)
+            else:
+                if self._current_page.url not in self._page_urls:
+                    self._pages.append(self._current_page)
+                    self._page_urls.add(self._current_page.url)
             self._current_page = None
         elif name == "image:image":
             self._current_page.images.append(self._current_image)
@@ -1076,6 +1269,16 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
         super().xml_element_end(name=name)
 
     def sitemap(self) -> AbstractSitemap:
+        if self._streaming_store is not None:
+            store = self._streaming_store
+            self._streaming_store = None
+            try:
+                store.finalize()
+                return PagesXMLSitemap(url=self._url, streaming_store=store)
+            except Exception:
+                store.close()
+                raise
+
         pages = []
 
         for page_row in self._pages:
@@ -1086,6 +1289,11 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
         pages_sitemap = PagesXMLSitemap(url=self._url, pages=pages)
 
         return pages_sitemap
+
+    def cleanup(self) -> None:
+        if self._streaming_store is not None:
+            self._streaming_store.close()
+            self._streaming_store = None
 
 
 class PagesRSSSitemapParser(AbstractXMLSitemapParser):

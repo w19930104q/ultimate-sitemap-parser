@@ -195,7 +195,7 @@ def get_url_retry_on_client_errors(
     return response
 
 
-def __response_is_gzipped_data(
+def response_is_gzipped_data(
     url: str, response: AbstractWebClientSuccessResponse
 ) -> bool:
     """
@@ -274,7 +274,7 @@ def ungzipped_response_content(
 
     data = response.raw_data()
 
-    if __response_is_gzipped_data(url=url, response=response):
+    if response_is_gzipped_data(url=url, response=response):
         try:
             data = gunzip(data, max_output_bytes=max_uncompressed_bytes)
         except GunzipException as ex:

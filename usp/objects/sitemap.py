@@ -16,6 +16,7 @@ import tempfile
 from collections.abc import Iterator
 from functools import cache
 
+from ..streaming import StreamingPagesStore
 from .page import SitemapPage
 
 log = logging.getLogger(__name__)
@@ -211,18 +212,37 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
 
     __slots__ = [
         "__pages_temp_file_path",
+        "__streaming_store",
     ]
 
-    def __init__(self, url: str, pages: list[SitemapPage]):
+    def __init__(
+        self,
+        url: str,
+        pages: list[SitemapPage] | None = None,
+        *,
+        streaming_store: StreamingPagesStore | None = None,
+    ):
         """
         Initialize new pages sitemap.
 
         :param url: Sitemap URL.
         :param pages: List of pages found in a sitemap.
+        :param streaming_store: Optional disk-backed page store. When given,
+            ``pages`` is ignored and pages are read from the store on demand.
         """
         super().__init__(url=url)
 
-        self._dump_pages(pages)
+        self.__streaming_store = None
+        self.__pages_temp_file_path = None
+
+        if streaming_store is not None:
+            streaming_store.finalize()
+            self.__streaming_store = streaming_store
+            # Keep the historical attribute pointing at the page data so that
+            # callers which inspect it continue to work.
+            self.__pages_temp_file_path = streaming_store.page_path
+        else:
+            self._dump_pages(pages or [])
 
     def _dump_pages(self, pages: list[SitemapPage]):
         fd, self.__pages_temp_file_path = tempfile.mkstemp()
@@ -231,9 +251,14 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
 
     def __del__(self):
         try:
-            os.unlink(self.__pages_temp_file_path)
+            if self.__streaming_store is not None:
+                self.__streaming_store.close()
+            elif self.__pages_temp_file_path is not None:
+                os.unlink(self.__pages_temp_file_path)
         except FileNotFoundError as e:
             log.warning("Unable to remove temp file", exc_info=e)
+        except Exception as e:  # pragma: no cover - defensive cleanup
+            log.warning("Unable to clean up pages sitemap", exc_info=e)
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, AbstractPagesSitemap):
@@ -253,8 +278,10 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
     def __getstate__(self) -> tuple[None, dict]:
         # Load slots of this class and its parents (mangling if appropriate)
         obj_slots = {slot: getattr(self, slot) for slot in _all_slots(self.__class__)}
-        # Replace temp file path with actual content
-        del obj_slots["_AbstractPagesSitemap__pages_temp_file_path"]
+        # Replace the temporary file/store references with actual content.
+        # Pickling is allowed to materialize the pages.
+        obj_slots.pop("_AbstractPagesSitemap__pages_temp_file_path", None)
+        obj_slots.pop("_AbstractPagesSitemap__streaming_store", None)
         obj_slots["_pages_value"] = self.pages
         return None, obj_slots
 
@@ -264,8 +291,11 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
         if "_pages_value" not in attrs:
             raise ValueError("State does not contain pages value")
         pages_val = attrs.pop("_pages_value")
+        # Drop any stale temp-file path from older pickles.
+        attrs.pop("_AbstractPagesSitemap__pages_temp_file_path", None)
         for slot, val in attrs.items():
             setattr(self, slot, val)
+        self.__streaming_store = None
         self._dump_pages(pages_val)
 
     def to_dict(self, with_pages=True) -> dict:
@@ -281,13 +311,34 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
     @property
     def pages(self) -> list[SitemapPage]:
         """
-        Load pages from disk swap file and return them.
+        Load pages from the backing storage and return them.
+
+        Streaming sitemaps materialize their pages on access; this is allowed
+        for the ``pages``/``to_dict``/pickle compatibility interfaces.
 
         :return: List of pages found in the sitemap.
         """
+        if self.__streaming_store is not None:
+            return list(self.__streaming_store.iter_pages())
+
         with open(self.__pages_temp_file_path, "rb") as tmp:
             pages = pickle.load(tmp)
         return pages
+
+    def all_pages(self) -> Iterator[SitemapPage]:
+        """
+        Return iterator which yields all pages of this sitemap.
+
+        For streaming sitemaps each call creates an independent iterator over
+        the disk-backed store, so iteration is repeatable and can be
+        interleaved without disturbing other readers.
+
+        :return: Iterator which yields all pages of this sitemap.
+        """
+        if self.__streaming_store is not None:
+            yield from self.__streaming_store.iter_pages()
+        else:
+            yield from self.pages
 
     @property
     def sub_sitemaps(self) -> list["AbstractSitemap"]:

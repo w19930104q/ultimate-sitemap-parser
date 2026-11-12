@@ -48,6 +48,7 @@ def sitemap_tree_for_homepage(
     recurse_callback: RecurseCallbackType | None = None,
     recurse_list_callback: RecurseListCallbackType | None = None,
     normalize_homepage_url: bool = True,
+    streaming: bool = False,
 ) -> AbstractSitemap:
     """
     Using a homepage URL, fetch the tree of sitemaps and pages listed in them.
@@ -63,6 +64,10 @@ def sitemap_tree_for_homepage(
     :param normalize_homepage_url: Whether to normalize the provided homepage URL to the domain root (default: True),
         e.g. "http://www.example.com/xxx/yyy/" -> "http://www.example.com/".
         Disabling this may prevent sitemap discovery via robots.txt, as robots.txt is typically only available at the domain root.
+    :param streaming: Whether to parse XML URL sets incrementally, keeping page data and
+        duplicate-detection state on temporary disk storage instead of in memory.
+        Disabled by default. The tree is returned only after crawling has completed;
+        ``all_pages`` can then be iterated repeatedly and interleaved.
 
     :return: Root sitemap object of the fetched sitemap tree.
     """
@@ -86,6 +91,10 @@ def sitemap_tree_for_homepage(
 
     sitemaps = []
 
+    # Only pass this keyword when enabled so that callers which inspect the
+    # SitemapFetcher arguments see the historical call shape by default.
+    streaming_kwargs = {"streaming": True} if streaming else {}
+
     sitemap_urls_found_in_robots_txt = set()
     if use_robots:
         robots_txt_fetcher = SitemapFetcher(
@@ -95,6 +104,7 @@ def sitemap_tree_for_homepage(
             parent_urls=set(),
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            **streaming_kwargs,
         )
         robots_txt_sitemap = robots_txt_fetcher.sitemap()
         if not isinstance(robots_txt_sitemap, InvalidSitemap):
@@ -118,6 +128,7 @@ def sitemap_tree_for_homepage(
                     quiet_404=True,
                     recurse_callback=recurse_callback,
                     recurse_list_callback=recurse_list_callback,
+                    **streaming_kwargs,
                 )
                 unpublished_sitemap = unpublished_sitemap_fetcher.sitemap()
 
@@ -130,13 +141,16 @@ def sitemap_tree_for_homepage(
     return index_sitemap
 
 
-def sitemap_from_str(content: str) -> AbstractSitemap:
+def sitemap_from_str(content: str, streaming: bool = False) -> AbstractSitemap:
     """Parse sitemap from a string.
 
     Will return the parsed sitemaps, and any sub-sitemaps will be returned as :class:`~.InvalidSitemap`.
 
     :param content: Sitemap string to parse
+    :param streaming: Whether to use the streaming parser. As the content is
+        already buffered, a client that cannot stream will use the original
+        parsing path.
     :return: Parsed sitemap
     """
-    fetcher = SitemapStrParser(static_content=content)
+    fetcher = SitemapStrParser(static_content=content, streaming=streaming)
     return fetcher.sitemap()

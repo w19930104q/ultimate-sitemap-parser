@@ -1,6 +1,7 @@
 """Implementation of :mod:`usp.web_client.abstract_client` with Requests."""
 
 import logging
+from collections.abc import Iterator
 from http import HTTPStatus
 
 import requests
@@ -60,6 +61,23 @@ class RequestsWebClientSuccessResponse(AbstractWebClientSuccessResponse):
             data = self.__requests_response.content
 
         return data
+
+    def supports_streaming(self) -> bool:
+        return True
+
+    def iter_content(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+        # requests decodes transport-level Content-Encoding (including gzip)
+        # when iterating over a streaming response.
+        yield from self.__requests_response.iter_content(chunk_size=chunk_size)
+
+    def close(self) -> None:
+        self.__requests_response.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - interpreter shutdown
+            pass
 
     def url(self) -> str:
         return self.__requests_response.url
@@ -165,6 +183,8 @@ class RequestsWebClient(AbstractWebClient):
             else:
                 message = f"{response.status_code} {response.reason}"
                 log.debug(f"Response content: {response.text}")
+                # The response will not be parsed, so release the connection.
+                response.close()
 
                 if response.status_code in RETRYABLE_HTTP_STATUS_CODES:
                     return RequestsWebClientErrorResponse(
